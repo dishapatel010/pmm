@@ -10,7 +10,8 @@ import {
   DialogueMessage, 
   StudentProfile, 
   LightweightResponse, 
-  SessionAnalysisResponse 
+  SessionAnalysisResponse,
+  DialogueThread
 } from "@/lib/types";
 
 // SECURITY: In-memory store for tracking IP/userId rate limits to prevent API abuse and cost spikes.
@@ -184,4 +185,38 @@ export async function closeSessionAction(
       updatedProfile: profile
     };
   }
+}
+
+/**
+ * Fetches the metadata list for all threads.
+ * 
+ * @param threads The full list of threads from client store.
+ * @returns Array of thread metadata without messages.
+ */
+export async function getThreadListAction(
+  threads: DialogueThread[]
+): Promise<Omit<DialogueThread, "messages">[]> {
+  return threads.map(t => ({
+    id: t.id,
+    createdAt: t.createdAt,
+    title: t.title,
+    moodSignal: t.moodSignal,
+    stressLevel: t.stressLevel,
+    closed: t.closed
+  }));
+}
+
+/**
+ * Fetches full message list for a specific thread ID.
+ * 
+ * @param threadId Target thread ID.
+ * @param threads Full list of threads.
+ * @returns Array of dialogue messages.
+ */
+export async function getThreadMessagesAction(
+  threadId: string,
+  threads: DialogueThread[]
+): Promise<DialogueMessage[]> {
+  const found = threads.find(t => t.id === threadId);
+  return found ? found.messages : [];
 }

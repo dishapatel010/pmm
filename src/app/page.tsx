@@ -10,14 +10,17 @@ import {
   ShieldAlert, 
   X, 
   Calendar,
-  Compass
+  Compass,
+  Menu,
+  Plus,
+  MessageSquare
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 
-import { submitMessageAction, closeSessionAction } from "./actions";
-import { DialogueMessage, StudentProfile, SavedSessionAnalysis } from "@/lib/types";
+import { submitMessageAction, closeSessionAction, getThreadListAction, getThreadMessagesAction } from "./actions";
+import { DialogueMessage, StudentProfile, SavedSessionAnalysis, DialogueThread } from "@/lib/types";
 
 const INITIAL_PROFILE: StudentProfile = {
   examType: "Unknown",
@@ -31,6 +34,12 @@ export default function Home() {
   const [thread, setThread] = React.useState<DialogueMessage[]>([]);
   const [savedAnalyses, setSavedAnalyses] = React.useState<SavedSessionAnalysis[]>([]);
   
+  // Threads History States
+  const [threads, setThreads] = React.useState<DialogueThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = React.useState<string>("");
+  const [threadListMetadata, setThreadListMetadata] = React.useState<Omit<DialogueThread, "messages">[]>([]);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = React.useState<boolean>(false);
+
   const [inputText, setInputText] = React.useState("");
   const [isTyping, setIsTyping] = React.useState(false);
   const [latestSuggestedAction, setLatestSuggestedAction] = React.useState<{ label: string, durationMinutes: number } | null>(null);
@@ -174,17 +183,62 @@ export default function Home() {
       }
     }
 
-    // Apply thread and check if it's from today (so we don't carry over multi-day sittings raw in input unless active)
-    if (migratedThread && migratedThread.length > 0) {
-      const lastMsgTime = new Date(migratedThread[migratedThread.length - 1].timestamp).toDateString();
-      const todayStr = new Date().toDateString();
-      
-      if (lastMsgTime !== todayStr) {
-        setThread([]);
-        localStorage.removeItem("mindpulse_thread_v3");
-      } else {
-        setThread(migratedThread);
+    // Load and initialize threads list
+    const savedThreads = localStorage.getItem("mindpulse_threads_list_v3");
+    let loadedThreads: DialogueThread[] = [];
+    if (savedThreads) {
+      try {
+        loadedThreads = JSON.parse(savedThreads);
+      } catch (e) {
+        console.error("Failed to parse saved threads list", e);
       }
+    }
+
+    // Wrap current open thread if none exists in list
+    if (loadedThreads.length === 0) {
+      const activeMsgs = (migratedThread && migratedThread.length > 0) ? migratedThread : [];
+      const firstMsgText = activeMsgs.find(m => m.role === "user")?.content || "Current Sitting";
+      const words = firstMsgText.trim().split(/\s+/);
+      const title = words.slice(0, 7).join(" ") + (words.length > 7 ? "..." : "");
+      
+      const defaultThread: DialogueThread = {
+        id: "thread_" + Date.now(),
+        createdAt: new Date().toISOString(),
+        title: title,
+        messages: activeMsgs,
+        closed: false
+      };
+      loadedThreads = [defaultThread];
+      localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(loadedThreads));
+    }
+
+    setThreads(loadedThreads);
+
+    // Call server action to load metadata of threads
+    const fetchMetadata = async (allThreads: DialogueThread[]) => {
+      try {
+        const list = await getThreadListAction(allThreads);
+        setThreadListMetadata(list);
+      } catch (e) {
+        console.error("Failed to fetch thread list metadata", e);
+      }
+    };
+    fetchMetadata(loadedThreads);
+
+    // Determine active thread
+    const active = loadedThreads.find(t => !t.closed) || loadedThreads[0];
+    if (active) {
+      setActiveThreadId(active.id);
+      // Fetch full messages from server action
+      const loadMessages = async () => {
+        try {
+          const msgs = await getThreadMessagesAction(active.id, loadedThreads);
+          setThread(msgs);
+        } catch (e) {
+          console.error("Failed to load thread messages", e);
+        }
+      };
+      loadMessages();
     }
 
     focusInput();
@@ -363,9 +417,34 @@ export default function Home() {
       timestamp: new Date().toISOString()
     };
 
-    const newThread = [...thread, userMessage];
-    setThread(newThread);
-    localStorage.setItem("mindpulse_thread_v3", JSON.stringify(newThread));
+    const newThreadMessages = [...thread, userMessage];
+    setThread(newThreadMessages);
+    localStorage.setItem("mindpulse_thread_v3", JSON.stringify(newThreadMessages));
+
+    // Update threads collection
+    const updatedThreads = threads.map(t => {
+      if (t.id === activeThreadId) {
+        let title = t.title;
+        // Generate title if it's the first message or a placeholder
+        if (t.messages.length === 0 || t.title === "Current Sitting" || t.title === "New Conversation") {
+          const words = currentText.trim().split(/\s+/);
+          title = words.slice(0, 7).join(" ") + (words.length > 7 ? "..." : "");
+        }
+        return {
+          ...t,
+          title,
+          messages: newThreadMessages
+        };
+      }
+      return t;
+    });
+    setThreads(updatedThreads);
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(updatedThreads));
+    
+    try {
+      const list = await getThreadListAction(updatedThreads);
+      setThreadListMetadata(list);
+    } catch (e) {}
 
     try {
       const reply = await submitMessageAction(currentText, thread.slice(-6), profile);
@@ -376,10 +455,27 @@ export default function Home() {
         timestamp: new Date().toISOString()
       };
 
-      const updatedThread = [...newThread, companionMessage];
-      setThread(updatedThread);
+      const finalThreadMessages = [...newThreadMessages, companionMessage];
+      setThread(finalThreadMessages);
       setLatestSuggestedAction(reply.suggestedMicroAction);
-      localStorage.setItem("mindpulse_thread_v3", JSON.stringify(updatedThread));
+      localStorage.setItem("mindpulse_thread_v3", JSON.stringify(finalThreadMessages));
+
+      const finalThreads = updatedThreads.map(t => {
+        if (t.id === activeThreadId) {
+          return {
+            ...t,
+            messages: finalThreadMessages
+          };
+        }
+        return t;
+      });
+      setThreads(finalThreads);
+      localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(finalThreads));
+      
+      try {
+        const list = await getThreadListAction(finalThreads);
+        setThreadListMetadata(list);
+      } catch (e) {}
     } catch (err) {
       toast.error("Companion connection is slow.");
     } finally {
@@ -413,10 +509,30 @@ export default function Home() {
       setThread([]);
       setLatestSuggestedAction(null);
 
+      // Close thread and store analysis results in it
+      const finalThreads = threads.map(t => {
+        if (t.id === activeThreadId) {
+          return {
+            ...t,
+            moodSignal: result.analysis.moodSignal,
+            stressLevel: result.analysis.stressLevel,
+            closed: true
+          };
+        }
+        return t;
+      });
+
+      setThreads(finalThreads);
       localStorage.setItem("mindpulse_profile_v3", JSON.stringify(result.updatedProfile));
       localStorage.setItem("mindpulse_analyses_v3", JSON.stringify(updatedAnalyses));
       localStorage.setItem("mindpulse_latest_analysis_v3", JSON.stringify(newAnalysis));
+      localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(finalThreads));
       localStorage.removeItem("mindpulse_thread_v3");
+
+      try {
+        const list = await getThreadListAction(finalThreads);
+        setThreadListMetadata(list);
+      } catch (e) {}
 
       setIsLookingBackOpen(true);
     } catch (e) {
@@ -431,6 +547,7 @@ export default function Home() {
     localStorage.removeItem("mindpulse_thread_v3");
     localStorage.removeItem("mindpulse_analyses_v3");
     localStorage.removeItem("mindpulse_latest_analysis_v3");
+    localStorage.removeItem("mindpulse_threads_list_v3");
 
     // Also remove legacy keys
     localStorage.removeItem("mindpulse_profile");
@@ -439,12 +556,74 @@ export default function Home() {
 
     setProfile(INITIAL_PROFILE);
     setThread([]);
+    setThreads([]);
+    setThreadListMetadata([]);
     setSavedAnalyses([]);
     setLatestAnalysis(null);
     setLatestSuggestedAction(null);
     setInputText("");
     stopSynthesizedAudio();
     toast.success("All memory cleared.");
+  };
+
+  const handleStartNewConversation = async () => {
+    const newId = "thread_" + Date.now();
+    const newThread: DialogueThread = {
+      id: newId,
+      createdAt: new Date().toISOString(),
+      title: "New Conversation",
+      messages: [],
+      closed: false
+    };
+
+    const updatedThreads = [newThread, ...threads];
+    setThreads(updatedThreads);
+    setActiveThreadId(newId);
+    setThread([]);
+    setLatestSuggestedAction(null);
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(updatedThreads));
+
+    try {
+      const list = await getThreadListAction(updatedThreads);
+      setThreadListMetadata(list);
+    } catch (e) {}
+    setIsMobileSidebarOpen(false);
+    focusInput();
+  };
+
+  const handleSelectThread = async (id: string) => {
+    setActiveThreadId(id);
+    try {
+      const msgs = await getThreadMessagesAction(id, threads);
+      setThread(msgs);
+    } catch (e) {
+      console.error(e);
+    }
+    setIsMobileSidebarOpen(false);
+  };
+
+  const getRelativeDateLabel = (isoString: string) => {
+    try {
+      const date = new Date(isoString);
+      const today = new Date();
+      const diffTime = Math.abs(today.setHours(0,0,0,0) - date.setHours(0,0,0,0));
+      const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+      if (diffDays === 0) return "Today";
+      if (diffDays === 1) return "Yesterday";
+      return `${diffDays} days ago`;
+    } catch (e) {
+      return "Unknown";
+    }
+  };
+
+  const getMoodDotColor = (mood?: string) => {
+    if (!mood || mood === "Unknown") return "bg-slate-300";
+    const m = mood.toLowerCase();
+    if (m.includes("anxious") || m.includes("stress") || m.includes("panick") || m.includes("overwhelm")) return "bg-red-400";
+    if (m.includes("hope") || m.includes("determined") || m.includes("confid")) return "bg-emerald-400";
+    if (m.includes("fatig") || m.includes("tir") || m.includes("stuck")) return "bg-amber-400";
+    return "bg-[#2563EB]";
   };
 
   const getStressColorClass = (level: number) => {
@@ -459,185 +638,312 @@ export default function Home() {
     return last.role === "companion" ? last.content : "Listening...";
   };
 
+  const activeThread = threads.find(t => t.id === activeThreadId);
+  const isClosed = activeThread ? activeThread.closed : false;
   const animationClass = reducedMotion ? "transition-none" : `transition-all duration-[500ms] ease-[cubic-bezier(0.32,0.72,0,1)]`;
 
   return (
-    <div className="flex-1 flex flex-col bg-[#FDFBF7] text-[#111827] font-sans selection:bg-blue-500/10 selection:text-blue-700 min-h-[100dvh] relative justify-between overflow-x-hidden">
+    <div className="flex-1 flex bg-[#FDFBF7] text-[#111827] font-sans selection:bg-blue-500/10 selection:text-blue-700 min-h-[100dvh] relative overflow-hidden">
       
       {/* Film grain noise overlay */}
       <div className="pointer-events-none fixed inset-0 z-50 bg-[radial-gradient(rgba(0,0,0,0.012)_1px,transparent_0)] bg-[size:16px_16px] opacity-[0.3]" />
 
-      {/* HEADER UTILITIES */}
-      <header className="px-6 py-5 flex items-center justify-between z-30 max-w-2xl w-full mx-auto bg-transparent">
-        <div className="flex items-center gap-2">
-          {/* ACCESSIBILITY: Semantic Heading structure */}
-          <h1 className="flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-widest text-[#111827]/60">
-            <span className="w-2 h-2 rounded-full bg-[#2563EB]" aria-hidden="true" />
-            MindPulse
-          </h1>
-        </div>
-
-        <div className="flex items-center gap-3">
-          <button 
-            onClick={() => {
-              if (soundscape === "none") startSynthesizedAudio("beats");
-              else if (soundscape === "beats") startSynthesizedAudio("rain");
-              else stopSynthesizedAudio();
-            }}
-            className="w-7 h-7 rounded-full flex items-center justify-center transition-all border border-[#111827]/10 bg-white hover:bg-slate-50 cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-            aria-label="Toggle synthesized soundscapes"
-          >
-            {soundscape !== "none" ? <Volume2 className="w-3.5 h-3.5 animate-pulse" /> : <VolumeX className="w-3.5 h-3.5" />}
-          </button>
-
-          <Dialog>
-            <DialogTrigger render={
-              <button 
-                className="w-7 h-7 rounded-full border border-red-200 bg-red-50/50 hover:bg-red-50 flex items-center justify-center text-red-600 cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-                aria-label="Crisis Support Helplines"
-              >
-                <ShieldAlert className="w-3.5 h-3.5" />
-              </button>
-            } />
-            <DialogContent className="bg-white border-slate-200 text-[#111827] max-w-sm rounded-xl">
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2 text-red-600 text-sm font-extrabold uppercase tracking-wider">
-                  Crisis Helplines
-                </DialogTitle>
-                <DialogDescription className="text-slate-500 text-[11px] leading-relaxed">
-                  If preparation anxiety is feeling unmanageable, please talk to professionals right now.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="space-y-2.5 my-1 text-xs">
-                <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                  <p className="font-bold">Vandrevala Foundation Support</p>
-                  <p className="text-[#2563EB] font-mono font-semibold mt-0.5">9999 666 555</p>
-                </div>
-              </div>
-            </DialogContent>
-          </Dialog>
-
-          {savedAnalyses.length > 0 && (
-            <button 
-              onClick={handleClearMemory}
-              className="text-[9px] font-bold text-red-600 hover:text-red-700 bg-white hover:bg-red-50 border border-[#111827]/5 px-2.5 py-1 rounded-md transition-colors cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-              aria-label="Reset Dialogue Memory"
+      {/* DESKTOP SIDEBAR / MOBILE COLLAPSIBLE PANEL */}
+      <aside 
+        className={`fixed inset-y-0 left-0 z-40 w-[260px] bg-[#F7F4EF] border-r border-[#111827]/5 flex flex-col justify-between transition-transform duration-300 md:relative md:translate-x-0 ${
+          isMobileSidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+        }`}
+        aria-label="Conversation history"
+      >
+        <div className="flex flex-col flex-1 min-h-0">
+          {/* Sidebar Header */}
+          <div className="p-4 flex items-center justify-between border-b border-[#111827]/5 shrink-0">
+            <span className="text-[10px] font-extrabold uppercase tracking-widest text-[#111827]/60">Sittings</span>
+            <button
+              onClick={handleStartNewConversation}
+              className="inline-flex items-center gap-1 text-[10px] font-bold text-[#2563EB] hover:text-blue-700 bg-white border border-[#111827]/5 px-2.5 py-1.5 rounded-md transition-colors cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              aria-label="Start fresh new conversation"
             >
-              Reset
+              <Plus className="w-3 h-3" />
+              New Sitting
             </button>
-          )}
-        </div>
-      </header>
-
-      {/* CORE EXPERIENCE COLUMN */}
-      <main className="flex-1 max-w-2xl w-full mx-auto px-6 flex flex-col justify-center relative">
-        <div className={`w-full space-y-8 py-8 ${animationClass}`}>
-          
-          {/* ACCESSIBILITY: aria-live region to ensure screen readers speak responses */}
-          <div className="space-y-4" aria-live="polite">
-            <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-[#111827] leading-relaxed select-text font-heading whitespace-pre-line">
-              {isTyping ? (
-                <span className="flex items-center gap-1.5 py-2 text-slate-400" aria-label="Companion is typing">
-                  <span className="w-2 h-2 bg-[#2563EB]/40 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <span className="w-2 h-2 bg-[#2563EB]/40 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <span className="w-2 h-2 bg-[#2563EB]/40 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                </span>
-              ) : (
-                getLatestVoiceMessage()
-              )}
-            </h2>
           </div>
 
-          {/* ACTIVE DIALOGUE MESSAGE LIST */}
-          {thread.length > 1 && (
-            <div className="space-y-2 pl-4 border-l border-slate-200 max-h-[140px] overflow-y-auto py-1.5 mask-linear">
-              {thread.slice(0, -1).map((msg, index) => (
-                <div key={index} className="text-xs">
-                  <span className={`font-extrabold ${msg.role === 'user' ? 'text-slate-400' : 'text-[#2563EB]/70'}`}>
-                    {msg.role === 'user' ? 'You: ' : 'Companion: '}
-                  </span>
-                  <span className="text-slate-500 font-medium">{msg.content}</span>
+          {/* Scrollable list */}
+          <div className="flex-1 overflow-y-auto p-2 space-y-1">
+            {threadListMetadata.map((t) => {
+              const isActive = t.id === activeThreadId;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => handleSelectThread(t.id)}
+                  aria-current={isActive ? "true" : undefined}
+                  className={`w-full text-left p-3 rounded-lg flex items-center justify-between transition-all duration-150 cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 ${
+                    isActive 
+                      ? "bg-[#2563EB]/5 text-[#2563EB] font-bold" 
+                      : "hover:bg-[#111827]/5 text-slate-700 font-semibold"
+                  }`}
+                >
+                  <div className="flex flex-col min-w-0 flex-1 pr-2">
+                    <span className="text-xs truncate block">{t.title || "Untitled Conversation"}</span>
+                    <span className="text-[9px] text-slate-400 mt-0.5">{getRelativeDateLabel(t.createdAt)}</span>
+                  </div>
+                  {t.moodSignal && (
+                    <span 
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${getMoodDotColor(t.moodSignal)}`} 
+                      title={`Mood Signal: ${t.moodSignal}`} 
+                      aria-hidden="true"
+                    />
+                  )}
+                </button>
+              );
+            })}
+            {threadListMetadata.length === 0 && (
+              <p className="text-[10px] text-slate-400 p-4 text-center">No past sittings yet.</p>
+            )}
+          </div>
+        </div>
+
+        {/* Sidebar Footer */}
+        <div className="p-4 border-t border-[#111827]/5 text-center shrink-0">
+          <p className="text-[8px] uppercase tracking-widest font-extrabold text-slate-400">
+            MindPulse Core
+          </p>
+        </div>
+      </aside>
+
+      {/* MOBILE BACKDROP */}
+      {isMobileSidebarOpen && (
+        <div 
+          onClick={() => setIsMobileSidebarOpen(false)}
+          className="fixed inset-0 bg-black/10 z-30 md:hidden"
+          aria-hidden="true"
+        />
+      )}
+
+      {/* CHAT/CONTENT WRAPPER */}
+      <div className="flex-1 flex flex-col min-h-[100dvh] justify-between relative min-w-0">
+        
+        {/* HEADER */}
+        <header className="px-6 py-5 flex items-center justify-between z-20 w-full bg-transparent border-b border-[#111827]/5 shrink-0">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsMobileSidebarOpen(!isMobileSidebarOpen)}
+              className="md:hidden w-7 h-7 rounded-full border border-[#111827]/10 bg-white hover:bg-slate-50 flex items-center justify-center cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              aria-label={isMobileSidebarOpen ? "Close conversation history" : "Show conversation history"}
+            >
+              <Menu className="w-3.5 h-3.5 text-slate-700" />
+            </button>
+
+            <h1 className="flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-widest text-[#111827]/60">
+              <span className="w-2 h-2 rounded-full bg-[#2563EB]" aria-hidden="true" />
+              MindPulse
+            </h1>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button 
+              onClick={() => {
+                if (soundscape === "none") startSynthesizedAudio("beats");
+                else if (soundscape === "beats") startSynthesizedAudio("rain");
+                else stopSynthesizedAudio();
+              }}
+              className="w-7 h-7 rounded-full flex items-center justify-center transition-all border border-[#111827]/10 bg-white hover:bg-slate-50 cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              aria-label="Toggle synthesized soundscapes"
+            >
+              {soundscape !== "none" ? <Volume2 className="w-3.5 h-3.5 animate-pulse" /> : <VolumeX className="w-3.5 h-3.5" />}
+            </button>
+
+            <Dialog>
+              <DialogTrigger render={
+                <button 
+                  className="w-7 h-7 rounded-full border border-red-200 bg-red-50/50 hover:bg-red-50 flex items-center justify-center text-red-600 cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                  aria-label="Crisis Support Helplines"
+                >
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                </button>
+              } />
+              <DialogContent className="bg-white border-slate-200 text-[#111827] max-w-sm rounded-xl">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2 text-red-600 text-sm font-extrabold uppercase tracking-wider">
+                    Crisis Helplines
+                  </DialogTitle>
+                  <DialogDescription className="text-slate-500 text-[11px] leading-relaxed">
+                    If preparation anxiety is feeling unmanageable, please talk to professionals right now.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-2.5 my-1 text-xs">
+                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+                    <p className="font-bold">Vandrevala Foundation Support</p>
+                    <p className="text-[#2563EB] font-mono font-semibold mt-0.5">9999 666 555</p>
+                  </div>
                 </div>
-              ))}
-            </div>
-          )}
+              </DialogContent>
+            </Dialog>
 
-          {/* SINGLE CORE INPUT FIELD */}
-          <form onSubmit={handleSendMessage} className="relative">
-            {/* ACCESSIBILITY: visually hidden label linked to input */}
-            <label htmlFor="student-dialogue-input" className="sr-only">
-              Share your thoughts, exams triggers, or backlogs with your companion
-            </label>
-            <div className="rounded-[2.2rem] p-1.5 bg-[#111827]/5 ring-1 ring-[#111827]/5 shadow-xs">
-              <div className="rounded-[calc(2.2rem-0.375rem)] bg-white p-4.5 border border-[#111827]/5 flex gap-2 h-16 items-center">
-                <input
-                  id="student-dialogue-input"
-                  ref={inputRef}
-                  placeholder="Share a study backlog, parent pressure, or reply..."
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  disabled={isTyping}
-                  className="flex-1 border-0 bg-transparent text-[#111827] placeholder:text-slate-400 focus-visible:ring-0 focus-visible:outline-none text-sm font-semibold leading-relaxed h-full pr-2 focus:ring-0"
-                  autoFocus
-                />
-                <button 
-                  type="submit" 
-                  disabled={isTyping || !inputText.trim()}
-                  className="bg-[#2563EB] hover:bg-blue-700 text-white w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 transition-transform duration-300 hover:scale-105 active:scale-95 cursor-pointer disabled:opacity-40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-                  aria-label="Send message"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-          </form>
-
-          {/* INTERACTION TRIMMINGS */}
-          <div className="flex flex-wrap items-center gap-3 pt-2 justify-between">
-            <div className="flex items-center gap-2">
-              {thread.length > 0 && (
-                <button 
-                  onClick={handleCloseSitting}
-                  disabled={isAnalyzingSession}
-                  className="text-[10px] font-bold text-slate-500 hover:text-[#2563EB] border border-[#111827]/5 bg-white px-4.5 py-2 rounded-full cursor-pointer hover:border-blue-100 hover:bg-blue-50/50 transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-                >
-                  {isAnalyzingSession ? "Reflecting..." : "Close Sitting / Compile Day"}
-                </button>
-              )}
-
-              {savedAnalyses.length > 0 && (
-                <button 
-                  onClick={() => setIsLookingBackOpen(true)}
-                  className="text-[10px] font-bold text-[#2563EB] bg-blue-50 border border-blue-100 px-4.5 py-2 rounded-full cursor-pointer hover:bg-blue-100/80 transition-all inline-flex items-center gap-1.5 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-                >
-                  <Calendar className="w-3 h-3" />
-                  Patterns & Reflection
-                </button>
-              )}
-            </div>
-
-            {/* Suggested Micro-action invitation */}
-            {latestSuggestedAction && (
+            {savedAnalyses.length > 0 && (
               <button 
-                onClick={() => {
-                  if (latestSuggestedAction.label.toLowerCase().includes("breathe")) {
-                    setBreathState("inhale");
-                    setBreathTimer(4);
-                    setIsBreathingOpen(true);
-                  } else {
-                    startSynthesizedAudio("beats");
-                  }
-                }}
-                className="text-[10px] font-bold text-[#2563EB] border border-blue-200 bg-blue-50 px-4.5 py-2 rounded-full cursor-pointer hover:bg-blue-100 transition-all flex items-center gap-1 shadow-2xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                onClick={handleClearMemory}
+                className="text-[9px] font-bold text-red-600 hover:text-red-700 bg-white hover:bg-red-50 border border-[#111827]/5 px-2.5 py-1 rounded-md transition-colors cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                aria-label="Reset Dialogue Memory"
               >
-                <Sparkles className="w-3 h-3 animate-pulse" />
-                {latestSuggestedAction.label} ({latestSuggestedAction.durationMinutes}m)
+                Reset
               </button>
             )}
           </div>
+        </header>
 
-        </div>
-      </main>
+        {/* CHAT AREA */}
+        <main className="flex-1 w-full max-w-2xl mx-auto px-6 flex flex-col justify-between py-6 min-h-0 relative">
+          
+          {/* Scrollable messages thread */}
+          <div 
+            className="flex-1 overflow-y-auto space-y-4 mb-4 pr-1 scrollbar-thin scroll-smooth"
+            aria-live="polite"
+          >
+            {/* Companion Voice Opening */}
+            <div className="space-y-4 py-4">
+              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-[#111827] leading-relaxed select-text font-heading whitespace-pre-line">
+                {getLatestVoiceMessage()}
+              </h2>
+            </div>
+
+            {/* Message History list */}
+            {thread.map((msg, index) => {
+              const isUser = msg.role === "user";
+              return (
+                <div 
+                  key={index}
+                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}
+                >
+                  <div 
+                    className={`max-w-[85%] rounded-2xl p-4 text-sm font-semibold leading-relaxed shadow-2xs group relative ${
+                      isUser 
+                        ? "bg-[#2563EB] text-white rounded-br-xs" 
+                        : "bg-white text-[#111827] border border-[#111827]/5 rounded-bl-xs"
+                    }`}
+                  >
+                    <p className="whitespace-pre-wrap select-text">{msg.content}</p>
+                    
+                    {/* Timestamp on hover */}
+                    <span className="absolute bottom-1 right-2 text-[8px] opacity-0 group-hover:opacity-75 transition-opacity text-slate-455 font-mono font-medium">
+                      {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Live Typing bubble */}
+            {isTyping && (
+              <div className="flex w-full justify-start animate-pulse">
+                <div className="bg-white text-[#111827] border border-[#111827]/5 rounded-2xl rounded-bl-xs p-4 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 bg-[#2563EB] rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1.5 h-1.5 bg-[#2563EB] rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 bg-[#2563EB] rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Bottom Controls */}
+          <div className="shrink-0 space-y-4">
+            
+            {/* Input Form */}
+            {isClosed ? (
+              <div className="p-4 bg-slate-50 border border-slate-200/50 rounded-2xl text-center space-y-2.5">
+                <p className="text-xs text-slate-500 font-bold leading-relaxed">This conversation sitting has ended and been analyzed.</p>
+                <button
+                  onClick={handleStartNewConversation}
+                  className="text-xs font-bold text-[#2563EB] hover:text-blue-700 bg-white border border-blue-100 hover:bg-blue-50/50 px-5 py-2.5 rounded-full shadow-2xs transition-all cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                >
+                  Start a new conversation to continue →
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleSendMessage} className="relative">
+                <label htmlFor="student-dialogue-input" className="sr-only">
+                  Share your thoughts, exams triggers, or backlogs with your companion
+                </label>
+                <div className="rounded-[2.2rem] p-1.5 bg-[#111827]/5 ring-1 ring-[#111827]/5 shadow-xs">
+                  <div className="rounded-[calc(2.2rem-0.375rem)] bg-white p-4.5 border border-[#111827]/5 flex gap-2 h-16 items-center">
+                    <input
+                      id="student-dialogue-input"
+                      ref={inputRef}
+                      placeholder="Share a study backlog, parent pressure, or reply..."
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      disabled={isTyping}
+                      className="flex-1 border-0 bg-transparent text-[#111827] placeholder:text-slate-400 focus-visible:ring-0 focus-visible:outline-none text-sm font-semibold leading-relaxed h-full pr-2 focus:ring-0"
+                      autoFocus
+                    />
+                    <button 
+                      type="submit" 
+                      disabled={isTyping || !inputText.trim()}
+                      className="bg-[#2563EB] hover:bg-blue-700 text-white w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 transition-transform duration-300 hover:scale-105 active:scale-95 cursor-pointer disabled:opacity-40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                      aria-label="Send message"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
+
+            {/* Actions Trimmings */}
+            <div className="flex flex-wrap items-center gap-3 pt-2 justify-between">
+              <div className="flex items-center gap-2">
+                {thread.length > 0 && !isClosed && (
+                  <button 
+                    onClick={handleCloseSitting}
+                    disabled={isAnalyzingSession}
+                    className="text-[10px] font-bold text-slate-500 hover:text-[#2563EB] border border-[#111827]/5 bg-white px-4.5 py-2 rounded-full cursor-pointer hover:border-blue-100 hover:bg-blue-50/50 transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                  >
+                    {isAnalyzingSession ? "Reflecting..." : "Close Sitting / Compile Day"}
+                  </button>
+                )}
+
+                {savedAnalyses.length > 0 && (
+                  <button 
+                    onClick={() => setIsLookingBackOpen(true)}
+                    className="text-[10px] font-bold text-[#2563EB] bg-blue-50 border border-blue-100 px-4.5 py-2 rounded-full cursor-pointer hover:bg-blue-100/80 transition-all inline-flex items-center gap-1.5 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                  >
+                    <Calendar className="w-3 h-3" />
+                    Patterns & Reflection
+                  </button>
+                )}
+              </div>
+
+              {latestSuggestedAction && (
+                <button 
+                  onClick={() => {
+                    if (latestSuggestedAction.label.toLowerCase().includes("breathe")) {
+                      setBreathState("inhale");
+                      setBreathTimer(4);
+                      setIsBreathingOpen(true);
+                    } else {
+                      startSynthesizedAudio("beats");
+                    }
+                  }}
+                  className="text-[10px] font-bold text-[#2563EB] border border-blue-200 bg-blue-50 px-4.5 py-2 rounded-full cursor-pointer hover:bg-blue-100 transition-all flex items-center gap-1 shadow-2xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                >
+                  <Sparkles className="w-3 h-3 animate-pulse" />
+                  {latestSuggestedAction.label} ({latestSuggestedAction.durationMinutes}m)
+                </button>
+              )}
+            </div>
+
+          </div>
+        </main>
+
+        {/* FOOTER */}
+        <footer className="px-6 py-4 flex items-center justify-center text-center text-[#111827]/40 z-10 shrink-0 border-t border-[#111827]/5">
+          <p className="text-[9px] uppercase tracking-widest font-extrabold">
+            MindPulse — Distraction-free Dialogue Space
+          </p>
+        </footer>
+
+      </div>
 
       {/* GUIDED BREATHING OVERLAY */}
       {isBreathingOpen && (
@@ -767,12 +1073,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* FOOTER */}
-      <footer className="px-6 py-4 flex items-center justify-center text-center text-[#111827]/40 z-20">
-        <p className="text-[9px] uppercase tracking-widest font-extrabold">
-          MindPulse — Distraction-free Dialogue Space
-        </p>
-      </footer>
     </div>
   );
 }

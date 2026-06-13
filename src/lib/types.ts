@@ -36,3 +36,13 @@ export interface SavedSessionAnalysis {
   stressLevel: number;
   timestamp: string;
 }
+
+export interface DialogueThread {
+  id: string;
+  createdAt: string; // ISO String
+  title: string;
+  messages: DialogueMessage[];
+  moodSignal?: string;
+  stressLevel?: number;
+  closed: boolean;
+}
