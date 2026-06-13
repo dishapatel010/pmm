@@ -4,10 +4,13 @@
 import { z } from "zod";
 import { 
   getLightweightReply, 
-  analyzeDialogueSession 
+  analyzeDialogueSession,
+  reframeNegativeThought
 } from "@/lib/gemini";
 import { 
+  AnyMessage,
   DialogueMessage, 
+  WidgetMessage,
   StudentProfile, 
   LightweightResponse, 
   SessionAnalysisResponse,
@@ -69,7 +72,7 @@ async function getAuthSession(): Promise<{ userId: string }> {
  */
 export async function submitMessageAction(
   text: string,
-  history: DialogueMessage[],
+  history: AnyMessage[],
   profile: StudentProfile
 ): Promise<LightweightResponse> {
   try {
@@ -113,6 +116,27 @@ export async function submitMessageAction(
 }
 
 /**
+ * Server action to reframe a negative thought.
+ */
+export async function reframeNegativeThoughtAction(
+  thought: string,
+  history: AnyMessage[],
+  profile: StudentProfile
+): Promise<string> {
+  try {
+    const session = await getAuthSession();
+    if (!session.userId) {
+      throw new Error("Unauthorized access attempt.");
+    }
+    return await reframeNegativeThought(thought, history, profile);
+  } catch (error) {
+    console.error("reframeNegativeThoughtAction failed:", error);
+    return "Let's take a slow breath first. We don't have to carry this all at once.";
+  }
+}
+
+
+/**
  * Compiles and analyzes the current dialogue sitting.
  * Updates target exams, triggers, and extracts pattern reflections.
  * 
@@ -124,7 +148,7 @@ export async function submitMessageAction(
  * @returns Analytical results and updated profile context.
  */
 export async function closeSessionAction(
-  history: DialogueMessage[],
+  history: AnyMessage[],
   profile: StudentProfile
 ): Promise<{ analysis: SessionAnalysisResponse; updatedProfile: StudentProfile }> {
   try {
@@ -149,15 +173,26 @@ export async function closeSessionAction(
       };
     }
 
-    // Clean historical inputs before processing
-    const cleanHistory = history.map(msg => ({
+    // Clean historical dialogue inputs before processing (excluding widgets and crisis messages)
+    const dialogueHistory = history.filter((msg): msg is DialogueMessage => msg.role === "user" || msg.role === "companion");
+    const cleanHistory = dialogueHistory.filter(msg => !msg.safetyFlag).map(msg => ({
       ...msg,
       content: sanitizeInput(msg.content)
     }));
 
     const analysis = await analyzeDialogueSession(cleanHistory, profile);
 
+    // Extract latest stress level directly from MoodCheck widget if user completed one
+    const moodCheckWidgets = history.filter((m): m is WidgetMessage => m.role === "companion-widget" && m.widgetType === "mood-check");
+    if (moodCheckWidgets.length > 0) {
+      const latestWidget = moodCheckWidgets[moodCheckWidgets.length - 1];
+      if (latestWidget.result && "stressLevel" in latestWidget.result) {
+        analysis.stressLevel = latestWidget.result.stressLevel;
+      }
+    }
+
     const updatedProfile: StudentProfile = {
+      name: profile.name ?? "",
       examType: analysis.examType,
       moodTrend: analysis.moodSignal,
       triggers: Array.from(new Set([...profile.triggers, ...analysis.triggers])),
@@ -216,7 +251,7 @@ export async function getThreadListAction(
 export async function getThreadMessagesAction(
   threadId: string,
   threads: DialogueThread[]
-): Promise<DialogueMessage[]> {
+): Promise<AnyMessage[]> {
   const found = threads.find(t => t.id === threadId);
   return found ? found.messages : [];
 }

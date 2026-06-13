@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
-import { DialogueMessage, StudentProfile, LightweightResponse, SessionAnalysisResponse } from "./types";
-import { getLightweightReplyPrompt, analyzeDialogueSessionPrompt } from "./prompts";
+import { DialogueMessage, StudentProfile, LightweightResponse, SessionAnalysisResponse, AnyMessage } from "./types";
+import { getLightweightReplyPrompt, analyzeDialogueSessionPrompt, reframeNegativeThoughtPrompt } from "./prompts";
 
 // SECURITY: Gemini API key is loaded strictly on the server-side via process.env.
 // This file is executed solely on the server context to prevent API key exposure to the client.
@@ -40,6 +40,49 @@ export async function callGemini(
 }
 
 /**
+ * Executes a raw text generation network call to the Gemini 2.5 Flash model (without requiring JSON).
+ */
+export async function callGeminiRaw(
+  prompt: string,
+  temperature: number = 0.7
+): Promise<string> {
+  const geminiCall = ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: prompt,
+    config: {
+      temperature: temperature,
+    },
+  });
+
+  // 8.5 seconds absolute timeout promise
+  const timeoutPromise = new Promise<never>((_, reject) => 
+    setTimeout(() => reject(new Error("Timeout")), 8500)
+  );
+
+  const response = await Promise.race([geminiCall, timeoutPromise]) as any;
+  return response.text || "";
+}
+
+/**
+ * Calls Gemini to reframe a negative thought.
+ */
+export async function reframeNegativeThought(
+  thought: string,
+  history: AnyMessage[],
+  profile: StudentProfile
+): Promise<string> {
+  const prompt = reframeNegativeThoughtPrompt(thought, history, profile);
+  try {
+    const response = await callGeminiRaw(prompt, 0.6);
+    return response.trim() || "Let's take a slow breath first. We don't have to carry this all at once.";
+  } catch (error) {
+    console.error("reframeNegativeThought failed:", error);
+    return "Let's take a slow breath first. We don't have to carry this all at once.";
+  }
+}
+
+
+/**
  * Shapes the raw JSON string from Gemini into a validated LightweightResponse.
  * This is a pure function, making it easily unit testable without network requests.
  * 
@@ -52,14 +95,28 @@ export function buildCompanionResponse(
   try {
     const parsed = JSON.parse(rawResult);
     return {
-      companionReply: parsed.companionReply || "I'm here for you.",
-      suggestedMicroAction: parsed.suggestedMicroAction || null
+      companionReply: parsed.companionReply || "",
+      suggestedMicroAction: parsed.suggestedMicroAction || null,
+      safetyFlag: !!parsed.safetyFlag,
+      safetyResponse: parsed.safetyResponse || null,
+      suggestedMoodCheck: parsed.suggestedMoodCheck || null,
+      suggestedChoice: parsed.suggestedChoice ? {
+        id: parsed.suggestedChoice.id,
+        question: parsed.suggestedChoice.question,
+        options: parsed.suggestedChoice.options,
+        allowMultiple: !!parsed.suggestedChoice.allowMultiple,
+        allowSkip: !!parsed.suggestedChoice.allowSkip
+      } : null
     };
   } catch (error) {
     console.error("Failed to parse companion response JSON:", error);
     return {
       companionReply: "I hear you. Take a slow breath. Let's tackle things one step at a time.",
-      suggestedMicroAction: null
+      suggestedMicroAction: null,
+      safetyFlag: false,
+      safetyResponse: null,
+      suggestedMoodCheck: null,
+      suggestedChoice: null
     };
   }
 }
@@ -114,7 +171,7 @@ export function buildSessionAnalysisResponse(
  */
 export async function getLightweightReply(
   text: string,
-  history: DialogueMessage[],
+  history: AnyMessage[],
   profile: StudentProfile
 ): Promise<LightweightResponse> {
   const prompt = getLightweightReplyPrompt(text, history, profile);

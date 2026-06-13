@@ -38,7 +38,23 @@ describe("buildCompanionResponse shaping logic", () => {
   test("processes missing parameters gracefully (empty/short entry returns defaults)", () => {
     const rawResult = JSON.stringify({});
     const parsed = buildCompanionResponse(rawResult);
-    expect(parsed.companionReply).toBe("I'm here for you.");
+    expect(parsed.companionReply).toBe("");
+    expect(parsed.suggestedMicroAction).toBeNull();
+    expect(parsed.safetyFlag).toBe(false);
+    expect(parsed.safetyResponse).toBeNull();
+  });
+
+  test("processes crisis safety fields correctly", () => {
+    const rawResult = JSON.stringify({
+      companionReply: "",
+      safetyFlag: true,
+      safetyResponse: "That sounds like a lot to carry. Please reach out to iCall at 9152987821.",
+      suggestedMicroAction: null
+    });
+    const parsed = buildCompanionResponse(rawResult);
+    expect(parsed.companionReply).toBe("");
+    expect(parsed.safetyFlag).toBe(true);
+    expect(parsed.safetyResponse).toBe("That sounds like a lot to carry. Please reach out to iCall at 9152987821.");
     expect(parsed.suggestedMicroAction).toBeNull();
   });
 
@@ -47,11 +63,14 @@ describe("buildCompanionResponse shaping logic", () => {
     const parsed = buildCompanionResponse(rawResult);
     expect(parsed.companionReply).toContain("Take a slow breath.");
     expect(parsed.suggestedMicroAction).toBeNull();
+    expect(parsed.safetyFlag).toBe(false);
+    expect(parsed.safetyResponse).toBeNull();
   });
 });
 
 describe("prompts.ts builders", () => {
   const mockProfile: StudentProfile = {
+    name: "Test User",
     examType: "JEE",
     moodTrend: "Anxious",
     triggers: ["mock test scores"],

@@ -19,10 +19,16 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 
-import { submitMessageAction, closeSessionAction, getThreadListAction, getThreadMessagesAction } from "./actions";
-import { DialogueMessage, StudentProfile, SavedSessionAnalysis, DialogueThread } from "@/lib/types";
+import { submitMessageAction, closeSessionAction, getThreadListAction, getThreadMessagesAction, reframeNegativeThoughtAction } from "./actions";
+import { DialogueMessage, StudentProfile, SavedSessionAnalysis, DialogueThread, WidgetMessage, AnyMessage } from "@/lib/types";
+import { OnboardingFlow, buildOpeningLine, type OnboardingAnswers } from "@/components/OnboardingFlow";
+import { MicroActionCard, type MicroActionFeedback } from "@/components/MicroActionCard";
+import { MoodCheck } from "@/components/MoodCheck";
+import { CompanionChoice } from "@/components/CompanionChoice";
+import { ReframeWidget } from "@/components/ReframeWidget";
 
 const INITIAL_PROFILE: StudentProfile = {
+  name: "",
   examType: "Unknown",
   moodTrend: "Unknown",
   triggers: [],
@@ -31,7 +37,8 @@ const INITIAL_PROFILE: StudentProfile = {
 
 export default function Home() {
   const [profile, setProfile] = React.useState<StudentProfile>(INITIAL_PROFILE);
-  const [thread, setThread] = React.useState<DialogueMessage[]>([]);
+  const [thread, setThread] = React.useState<AnyMessage[]>([]);
+  const [widgetMessages, setWidgetMessages] = React.useState<WidgetMessage[]>([]);
   const [savedAnalyses, setSavedAnalyses] = React.useState<SavedSessionAnalysis[]>([]);
   
   // Threads History States
@@ -39,10 +46,20 @@ export default function Home() {
   const [activeThreadId, setActiveThreadId] = React.useState<string>("");
   const [threadListMetadata, setThreadListMetadata] = React.useState<Omit<DialogueThread, "messages">[]>([]);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = React.useState<boolean>(false);
+  // Onboarding: true when this is a brand-new user with no stored data
+  const [isOnboarding, setIsOnboarding] = React.useState<boolean>(false);
 
   const [inputText, setInputText] = React.useState("");
   const [isTyping, setIsTyping] = React.useState(false);
   const [latestSuggestedAction, setLatestSuggestedAction] = React.useState<{ label: string, durationMinutes: number } | null>(null);
+  const [latestSuggestedMoodCheck, setLatestSuggestedMoodCheck] = React.useState<{ question: string, minLabel?: string, maxLabel?: string } | null>(null);
+  const [latestSuggestedChoice, setLatestSuggestedChoice] = React.useState<{ id: string, question: string, options: { label: string, value: string }[], allowMultiple?: boolean, allowSkip?: boolean } | null>(null);
+  
+  // Mascot Wellness Pet States
+  const [petMascot, setPetMascot] = React.useState<"cat" | "owl" | "panda">("cat");
+  const [petStatus, setPetStatus] = React.useState<string>("Purr... ready to breathe when you are!");
+  const [isPetMenuOpen, setIsPetMenuOpen] = React.useState<boolean>(false);
+  const [activeReframeOriginalThought, setActiveReframeOriginalThought] = React.useState<string | null>(null);
   
   // Reflection view states
   const [isLookingBackOpen, setIsLookingBackOpen] = React.useState(false);
@@ -102,6 +119,7 @@ export default function Home() {
       try {
         const parsedLegacyP = JSON.parse(legacyProfile);
         migratedProfile = {
+          name: parsedLegacyP.name || "",
           examType: parsedLegacyP.examType || "Unknown",
           moodTrend: parsedLegacyP.moodTrend || parsedLegacyP.mood || "Unknown",
           triggers: parsedLegacyP.triggers || [],
@@ -192,6 +210,16 @@ export default function Home() {
       } catch (e) {
         console.error("Failed to parse saved threads list", e);
       }
+    }
+
+    // ── First-visit detection ──────────────────────────────────────────────
+    // Show onboarding if: no v3 profile saved AND no threads list saved.
+    // Legacy migration already ran above — if a migrated profile was found,
+    // migratedProfile will be non-null and we skip onboarding.
+    const isFirstVisit = !savedP && !legacyProfile && !savedThreads;
+    if (isFirstVisit) {
+      setIsOnboarding(true);
+      return; // Skip all thread init — onboarding will create the first thread
     }
 
     // Wrap current open thread if none exists in list
@@ -363,6 +391,142 @@ export default function Home() {
     return () => stopSynthesizedAudio();
   }, []);
 
+  /**
+   * appendWidgetResult — stores a widget interaction result as a WidgetMessage
+   * in the thread so it's available for end-of-sitting analysis.
+   */
+  const appendWidgetResult = (
+    widgetType: WidgetMessage["widgetType"],
+    result: WidgetMessage["result"],
+    summary: string
+  ) => {
+    const msg: WidgetMessage = {
+      role: "companion-widget",
+      widgetType,
+      summary,
+      result,
+      timestamp: new Date().toISOString(),
+    };
+    const newThread = [...thread, msg];
+    setThread(newThread);
+    localStorage.setItem("mindpulse_thread_v3", JSON.stringify(newThread));
+
+    const updatedThreads = threads.map((t) =>
+      t.id === activeThreadId ? { ...t, messages: newThread as DialogueMessage[] } : t
+    );
+    setThreads(updatedThreads);
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(updatedThreads));
+  };
+
+  const handleMicroActionComplete = (feedback: MicroActionFeedback) => {
+    if (!latestSuggestedAction) return;
+    setLatestSuggestedAction(null);
+    appendWidgetResult(
+      "micro-action",
+      { type: "micro-action", feedback },
+      `${latestSuggestedAction.label} — ${feedback === "helped" ? "Helped 🙂" : feedback === "not_really" ? "Not really" : feedback === "meh" ? "Meh" : "Skipped"}`
+    );
+  };
+
+  const handleMoodCheckAnswer = (value: number) => {
+    if (!latestSuggestedMoodCheck) return;
+    setLatestSuggestedMoodCheck(null);
+    appendWidgetResult(
+      "mood-check",
+      { type: "mood-check", stressLevel: value },
+      `Stress level check: ${value}/10`
+    );
+  };
+
+  const handleChoiceAnswer = (value: string | string[]) => {
+    if (!latestSuggestedChoice) return;
+    const choice = latestSuggestedChoice;
+    setLatestSuggestedChoice(null);
+    const displayValues = Array.isArray(value) ? value : [value];
+    const displayLabels = displayValues
+      .map((v) => choice.options.find((o) => o.value === v)?.label ?? v)
+      .filter(Boolean)
+      .join(", ");
+
+    appendWidgetResult(
+      "micro-action",
+      { type: "micro-action", feedback: "helped" },
+      `${choice.question} — Answered: ${displayLabels}`
+    );
+  };
+
+  const handleReframeDone = (
+    original: string,
+    reframed: string,
+    feedbackVal: "yeah_kind_of" | "not_really" | "still_struggling" | "no_thanks"
+  ) => {
+    setActiveReframeOriginalThought(null);
+    
+    // Add widget result message
+    const widgetMsg: WidgetMessage = {
+      role: "companion-widget",
+      widgetType: "reframe",
+      summary: `Reframe Activity: ${feedbackVal === "no_thanks" ? "Declined" : "Completed"}`,
+      result: {
+        type: "reframe",
+        originalThought: original,
+        reframedThought: reframed,
+        feedback: feedbackVal
+      },
+      timestamp: new Date().toISOString()
+    };
+
+    // If yes and reframed, add reframed thought as companion reply and feedback as user reply
+    let newMsgs: AnyMessage[] = [...thread, widgetMsg];
+    if (feedbackVal !== "no_thanks" && reframed) {
+      const companionMsg: DialogueMessage = {
+        role: "companion",
+        content: reframed,
+        timestamp: new Date().toISOString()
+      };
+      
+      const userFeedbackLabel =
+        feedbackVal === "yeah_kind_of" ? "Yeah, kind of" :
+        feedbackVal === "not_really" ? "Not really" :
+        "Still struggling";
+
+      const userMsg: DialogueMessage = {
+        role: "user",
+        content: userFeedbackLabel,
+        timestamp: new Date().toISOString()
+      };
+      newMsgs = [...newMsgs, companionMsg, userMsg];
+
+      // If Not really or Still struggling, companion responds warmly without pushing further
+      if (feedbackVal === "not_really" || feedbackVal === "still_struggling") {
+        const warmFallbackMsg: DialogueMessage = {
+          role: "companion",
+          content: "That is completely fine. We don't have to get it perfect today. Just take it one step at a time.",
+          timestamp: new Date().toISOString()
+        };
+        newMsgs = [...newMsgs, warmFallbackMsg];
+      }
+    } else if (feedbackVal === "no_thanks") {
+      // User chose No thanks
+      const warmFallbackMsg: DialogueMessage = {
+        role: "companion",
+        content: "No pressure at all dost. We'll take things at your pace.",
+        timestamp: new Date().toISOString()
+      };
+      newMsgs = [...newMsgs, warmFallbackMsg];
+    }
+
+    setThread(newMsgs);
+    localStorage.setItem("mindpulse_thread_v3", JSON.stringify(newMsgs));
+
+    const updatedThreads = threads.map((t) =>
+      t.id === activeThreadId ? { ...t, messages: newMsgs as DialogueMessage[] } : t
+    );
+    setThreads(updatedThreads);
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(updatedThreads));
+  };
+
+
   const getBreathInstruction = () => {
     switch (breathState) {
       case "inhale": return "Inhale slowly...";
@@ -406,6 +570,11 @@ export default function Home() {
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim() || isTyping) return;
+
+    // Reset active suggestions
+    setLatestSuggestedAction(null);
+    setLatestSuggestedMoodCheck(null);
+    setLatestSuggestedChoice(null);
 
     const currentText = inputText;
     setInputText("");
@@ -451,13 +620,21 @@ export default function Home() {
 
       const companionMessage: DialogueMessage = {
         role: "companion",
-        content: reply.companionReply,
-        timestamp: new Date().toISOString()
+        content: reply.safetyFlag ? (reply.safetyResponse || reply.companionReply) : reply.companionReply,
+        timestamp: new Date().toISOString(),
+        safetyFlag: reply.safetyFlag
       };
 
       const finalThreadMessages = [...newThreadMessages, companionMessage];
       setThread(finalThreadMessages);
-      setLatestSuggestedAction(reply.suggestedMicroAction);
+      setLatestSuggestedAction(reply.safetyFlag ? null : reply.suggestedMicroAction);
+      setLatestSuggestedMoodCheck(reply.safetyFlag ? null : (reply.suggestedMoodCheck ?? null));
+      if (!reply.safetyFlag && reply.suggestedChoice?.id === "reframe-trigger") {
+        setActiveReframeOriginalThought(currentText);
+        setLatestSuggestedChoice(null); // Clear suggestedChoice, we will render ReframeWidget instead
+      } else {
+        setLatestSuggestedChoice(reply.safetyFlag ? null : (reply.suggestedChoice ?? null));
+      }
       localStorage.setItem("mindpulse_thread_v3", JSON.stringify(finalThreadMessages));
 
       const finalThreads = updatedThreads.map(t => {
@@ -508,6 +685,8 @@ export default function Home() {
       setLatestAnalysis(newAnalysis);
       setThread([]);
       setLatestSuggestedAction(null);
+      setLatestSuggestedMoodCheck(null);
+      setLatestSuggestedChoice(null);
 
       // Close thread and store analysis results in it
       const finalThreads = threads.map(t => {
@@ -566,6 +745,84 @@ export default function Home() {
     toast.success("All memory cleared.");
   };
 
+  /**
+   * handleOnboardingComplete — called when the user finishes the onboarding flow.
+   * Creates the StudentProfile, writes it to localStorage, creates the first
+   * thread with a personalized welcome companion message, and exits onboarding.
+   */
+  const handleOnboardingComplete = async (onboardingAnswers: OnboardingAnswers) => {
+    // Build profile from answers
+    const newProfile: StudentProfile = {
+      name: onboardingAnswers.name,
+      examType: onboardingAnswers.targetExam || "Unknown",
+      moodTrend: "Unknown",
+      triggers: onboardingAnswers.stressPatterns,
+      lastTopics: [],
+    };
+
+    // Personalized companion opening line
+    const welcomeText = buildOpeningLine(onboardingAnswers);
+
+    const welcomeMessage: DialogueMessage = {
+      role: "companion",
+      content: welcomeText,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Create first thread
+    const firstThreadId = "thread_" + Date.now();
+    const firstThread: DialogueThread = {
+      id: firstThreadId,
+      createdAt: new Date().toISOString(),
+      title: "First Sitting",
+      messages: [welcomeMessage],
+      closed: false,
+    };
+
+    const allThreads = [firstThread];
+
+    // Persist
+    localStorage.setItem("mindpulse_profile_v3", JSON.stringify(newProfile));
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(allThreads));
+    localStorage.setItem("mindpulse_thread_v3", JSON.stringify([welcomeMessage]));
+
+    // Update state
+    setProfile(newProfile);
+    setThreads(allThreads);
+    setActiveThreadId(firstThreadId);
+    setThread([welcomeMessage]);
+    setIsOnboarding(false);
+
+    // Fetch metadata
+    try {
+      const list = await getThreadListAction(allThreads);
+      setThreadListMetadata(list);
+    } catch (e) {}
+
+    setTimeout(() => focusInput(), 100);
+  };
+
+  const handleOnboardingSkip = () => {
+    // Create a minimal default profile and empty first thread
+    const defaultProfile: StudentProfile = { ...INITIAL_PROFILE };
+    const firstThreadId = "thread_" + Date.now();
+    const firstThread: DialogueThread = {
+      id: firstThreadId,
+      createdAt: new Date().toISOString(),
+      title: "First Sitting",
+      messages: [],
+      closed: false,
+    };
+    localStorage.setItem("mindpulse_profile_v3", JSON.stringify(defaultProfile));
+    localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify([firstThread]));
+    setProfile(defaultProfile);
+    setThreads([firstThread]);
+    setActiveThreadId(firstThreadId);
+    setThread([]);
+    setIsOnboarding(false);
+    setTimeout(() => focusInput(), 100);
+  };
+
   const handleStartNewConversation = async () => {
     const newId = "thread_" + Date.now();
     const newThread: DialogueThread = {
@@ -581,6 +838,8 @@ export default function Home() {
     setActiveThreadId(newId);
     setThread([]);
     setLatestSuggestedAction(null);
+    setLatestSuggestedMoodCheck(null);
+    setLatestSuggestedChoice(null);
     localStorage.setItem("mindpulse_threads_list_v3", JSON.stringify(updatedThreads));
 
     try {
@@ -704,6 +963,97 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Mascot Wellness Pet Widget */}
+        <div className="p-3 mx-2 my-1 border border-[#111827]/5 bg-white/70 rounded-xl space-y-2 text-center shadow-2xs">
+          <div className="flex items-center gap-2.5 justify-start text-left">
+            <span className="text-3xl animate-bounce select-none duration-1000 origin-bottom" style={{ animationDuration: "2s" }} role="img" aria-label="Mascot Pet">
+              {petMascot === "cat" ? "🐱" : petMascot === "owl" ? "🦉" : "🐼"}
+            </span>
+            <div className="flex-1 min-w-0">
+              <p className="text-[10px] font-extrabold text-[#2563EB] uppercase tracking-wider">
+                {petMascot === "cat" ? "Calm Cat" : petMascot === "owl" ? "Focus Owl" : "Pacing Panda"}
+              </p>
+              <p className="text-[10px] font-bold text-slate-500 leading-snug truncate">
+                {petStatus}
+              </p>
+            </div>
+          </div>
+          
+          <div className="flex flex-col gap-1">
+            <button
+              onClick={() => setIsPetMenuOpen(!isPetMenuOpen)}
+              className="w-full text-[9px] font-extrabold uppercase tracking-wider py-1 border border-[#111827]/5 bg-white rounded-md hover:bg-slate-50 transition-colors cursor-pointer"
+            >
+              Interact
+            </button>
+            
+            {isPetMenuOpen && (
+              <div className="pt-1.5 border-t border-[#111827]/5 space-y-1.5 flex flex-col items-stretch text-left">
+                <span className="text-[8px] font-extrabold uppercase tracking-widest text-slate-400 block mb-0.5">Pet Actions</span>
+                <button
+                  onClick={() => {
+                    setIsBreathingOpen(true);
+                    setBreathState("inhale");
+                    setPetStatus(petMascot === "cat" ? "Breathe in... Breathe out..." : petMascot === "owl" ? "Calming down..." : "Taking a break...");
+                    setIsPetMenuOpen(false);
+                  }}
+                  className="text-[9px] font-bold text-left px-2 py-1 hover:bg-[#2563EB]/5 rounded text-slate-700 cursor-pointer"
+                >
+                  🧘 Breathe with me
+                </button>
+                <button
+                  onClick={() => {
+                    setPetStatus(
+                      petMascot === "cat" ? "Purr! Nyam nyam... happy cat! ❤️" :
+                      petMascot === "owl" ? "Hoot! Delicious treat! Ready to study! ❤️" :
+                      "Nom nom... panda is full and happy! ❤️"
+                    );
+                    toast.success("Mascot treat delivered! ❤️");
+                    setIsPetMenuOpen(false);
+                  }}
+                  className="text-[9px] font-bold text-left px-2 py-1 hover:bg-[#2563EB]/5 rounded text-slate-700 cursor-pointer"
+                >
+                  🍪 Give a treat
+                </button>
+                
+                <span className="text-[8px] font-extrabold uppercase tracking-widest text-slate-400 block mb-0.5 mt-1">Change Mascot</span>
+                <div className="grid grid-cols-3 gap-1">
+                  <button
+                    onClick={() => {
+                      setPetMascot("cat");
+                      setPetStatus("Purr... ready to breathe when you are!");
+                      setIsPetMenuOpen(false);
+                    }}
+                    className={`text-[9px] font-bold py-1 border rounded cursor-pointer text-center ${petMascot === "cat" ? "border-[#2563EB] bg-blue-50/50 text-[#2563EB]" : "border-[#111827]/5 bg-white"}`}
+                  >
+                    🐱 Cat
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPetMascot("owl");
+                      setPetStatus("Whoot! Focused on your prep!");
+                      setIsPetMenuOpen(false);
+                    }}
+                    className={`text-[9px] font-bold py-1 border rounded cursor-pointer text-center ${petMascot === "owl" ? "border-[#2563EB] bg-blue-50/50 text-[#2563EB]" : "border-[#111827]/5 bg-white"}`}
+                  >
+                    🦉 Owl
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPetMascot("panda");
+                      setPetStatus("Yawn... Don't forget to stretch!");
+                      setIsPetMenuOpen(false);
+                    }}
+                    className={`text-[9px] font-bold py-1 border rounded cursor-pointer text-center ${petMascot === "panda" ? "border-[#2563EB] bg-blue-50/50 text-[#2563EB]" : "border-[#111827]/5 bg-white"}`}
+                  >
+                    🐼 Panda
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* Sidebar Footer */}
         <div className="p-4 border-t border-[#111827]/5 text-center shrink-0">
           <p className="text-[8px] uppercase tracking-widest font-extrabold text-slate-400">
@@ -801,28 +1151,65 @@ export default function Home() {
             className="flex-1 overflow-y-auto space-y-4 mb-4 pr-1 scrollbar-thin scroll-smooth"
             aria-live="polite"
           >
-            {/* Companion Voice Opening */}
-            <div className="space-y-4 py-4">
-              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-[#111827] leading-relaxed select-text font-heading whitespace-pre-line">
-                {getLatestVoiceMessage()}
-              </h2>
-            </div>
+            {/* ── ONBOARDING GATE ────────────────────────────────────────── */}
+            {isOnboarding ? (
+              <div className="space-y-4 py-4">
+                <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-[#111827] leading-relaxed select-text font-heading">
+                  Hey — I&apos;m your MindPulse companion. Let me get to know you a little.
+                </h2>
+                <p className="text-sm font-semibold text-slate-500">
+                  Quick setup — takes under 30 seconds.
+                </p>
+                <OnboardingFlow
+                  onComplete={handleOnboardingComplete}
+                  onSkip={handleOnboardingSkip}
+                />
+              </div>
+            ) : (
+              <>
+              {/* If thread is empty, render the opening line as a companion chat bubble */}
+              {thread.length === 0 && (
+                <div className="flex w-full justify-start py-2">
+                  <div className="max-w-[85%] rounded-2xl rounded-bl-xs p-4 bg-white border border-[#111827]/5 text-sm font-semibold text-[#111827] shadow-2xs">
+                    <p className="whitespace-pre-wrap select-text">{openingLine}</p>
+                  </div>
+                </div>
+              )}
 
-            {/* Message History list */}
+             {/* Message History list */}
             {thread.map((msg, index) => {
+              if (msg.role === "companion-widget") {
+                // Collapsed widget summary in thread history
+                return (
+                  <div key={index} className="flex justify-center">
+                    <span className="text-[10px] font-bold text-slate-400 bg-slate-50 border border-slate-100 px-3 py-1.5 rounded-full">
+                      {msg.summary}
+                    </span>
+                  </div>
+                );
+              }
               const isUser = msg.role === "user";
+              const isSafety = !isUser && msg.safetyFlag;
               return (
                 <div 
                   key={index}
-                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}
+                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"} ${isSafety ? "my-6" : ""}`}
                 >
                   <div 
-                    className={`max-w-[85%] rounded-2xl p-4 text-sm font-semibold leading-relaxed shadow-2xs group relative ${
+                    className={`max-w-[85%] rounded-2xl text-sm font-semibold leading-relaxed shadow-2xs group relative ${
                       isUser 
-                        ? "bg-[#2563EB] text-white rounded-br-xs" 
-                        : "bg-white text-[#111827] border border-[#111827]/5 rounded-bl-xs"
+                        ? "bg-[#2563EB] text-white rounded-br-xs p-4" 
+                        : isSafety
+                          ? "bg-white text-[#111827] border-2 border-red-200/80 rounded-bl-xs p-6 sm:p-7 shadow-xs"
+                          : "bg-white text-[#111827] border border-[#111827]/5 rounded-bl-xs p-4"
                     }`}
                   >
+                    {isSafety && (
+                      <div className="flex items-center gap-2 mb-3 text-red-600">
+                        <ShieldAlert className="w-4.5 h-4.5 shrink-0" />
+                        <span className="text-[10px] font-extrabold uppercase tracking-widest">Support Guardrail</span>
+                      </div>
+                    )}
                     <p className="whitespace-pre-wrap select-text">{msg.content}</p>
                     
                     {/* Timestamp on hover */}
@@ -834,6 +1221,44 @@ export default function Home() {
               );
             })}
 
+            {/* Active suggested widgets */}
+            {latestSuggestedMoodCheck && (
+              <div className="my-4 pt-1">
+                <MoodCheck
+                  question={latestSuggestedMoodCheck.question}
+                  min={1}
+                  max={10}
+                  labels={{ min: latestSuggestedMoodCheck.minLabel || "calm", max: latestSuggestedMoodCheck.maxLabel || "overwhelmed" }}
+                  onAnswer={handleMoodCheckAnswer}
+                />
+              </div>
+            )}
+            
+            {activeReframeOriginalThought && (
+              <div className="my-4 pt-1">
+                <ReframeWidget
+                  originalThought={activeReframeOriginalThought}
+                  onDone={handleReframeDone}
+                  reframeAction={async (thought) => {
+                    return await reframeNegativeThoughtAction(thought, thread.slice(-6), profile);
+                  }}
+                />
+              </div>
+            )}
+
+            {latestSuggestedChoice && (
+              <div className="my-4 pt-1">
+                <CompanionChoice
+                  id={latestSuggestedChoice.id}
+                  question={latestSuggestedChoice.question}
+                  options={latestSuggestedChoice.options}
+                  allowMultiple={latestSuggestedChoice.allowMultiple}
+                  allowSkip={latestSuggestedChoice.allowSkip}
+                  onAnswer={handleChoiceAnswer}
+                />
+              </div>
+            )}
+
             {/* Live Typing bubble */}
             {isTyping && (
               <div className="flex w-full justify-start animate-pulse">
@@ -844,10 +1269,12 @@ export default function Home() {
                 </div>
               </div>
             )}
+              </>
+            )}
           </div>
 
-          {/* Bottom Controls */}
-          <div className="shrink-0 space-y-4">
+          {/* Bottom Controls — hidden during onboarding */}
+          <div className={`shrink-0 space-y-4 ${isOnboarding ? "hidden" : ""}`}>
             
             {/* Input Form */}
             {isClosed ? (
@@ -915,21 +1342,21 @@ export default function Home() {
               </div>
 
               {latestSuggestedAction && (
-                <button 
-                  onClick={() => {
-                    if (latestSuggestedAction.label.toLowerCase().includes("breathe")) {
-                      setBreathState("inhale");
-                      setBreathTimer(4);
-                      setIsBreathingOpen(true);
-                    } else {
-                      startSynthesizedAudio("beats");
+                <div className="pt-1">
+                  <MicroActionCard
+                    title={latestSuggestedAction.label}
+                    description="Take a moment to reset before continuing."
+                    durationSeconds={latestSuggestedAction.durationMinutes * 60}
+                    actionType={
+                      latestSuggestedAction.label.toLowerCase().includes("breath") ? "box_breathing" :
+                      latestSuggestedAction.label.toLowerCase().includes("ground") ? "grounding_pause" :
+                      latestSuggestedAction.label.toLowerCase().includes("stretch") ? "quick_stretch" :
+                      undefined
                     }
-                  }}
-                  className="text-[10px] font-bold text-[#2563EB] border border-blue-200 bg-blue-50 px-4.5 py-2 rounded-full cursor-pointer hover:bg-blue-100 transition-all flex items-center gap-1 shadow-2xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-                >
-                  <Sparkles className="w-3 h-3 animate-pulse" />
-                  {latestSuggestedAction.label} ({latestSuggestedAction.durationMinutes}m)
-                </button>
+                    reducedMotion={reducedMotion}
+                    onComplete={handleMicroActionComplete}
+                  />
+                </div>
               )}
             </div>
 

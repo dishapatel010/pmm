@@ -34,3 +34,7 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## Safety & Limitations
+MindPulse includes a crisis-response safety guardrail that detects expressions of hopelessness, worthlessness, self-harm, or severe emotional crisis. Please note that this is a safety guardrail heuristic, not a diagnostic or clinical feature. MindPulse is NOT a substitute for professional mental health support or diagnostic evaluation.
+
