@@ -70,31 +70,123 @@ export default function Home() {
     }, 50);
   };
 
-  // Load state on mount
+  // Load state on mount with legacy migration layer
   React.useEffect(() => {
+    // Check if new keys exist
     const savedP = localStorage.getItem("mindpulse_profile_v3");
     const savedT = localStorage.getItem("mindpulse_thread_v3");
     const savedA = localStorage.getItem("mindpulse_analyses_v3");
     const savedLA = localStorage.getItem("mindpulse_latest_analysis_v3");
 
-    if (savedP) setProfile(JSON.parse(savedP));
-    if (savedA) setSavedAnalyses(JSON.parse(savedA));
-    if (savedLA) setLatestAnalysis(JSON.parse(savedLA));
+    // Read legacy keys
+    const legacyProfile = localStorage.getItem("mindpulse_profile");
+    const legacyResponse = localStorage.getItem("mindpulse_latest_response");
+    const legacyAnalysis = localStorage.getItem("mindpulse_latest_analysis");
 
-    if (savedT) {
-      const parsedT: DialogueMessage[] = JSON.parse(savedT);
-      if (parsedT.length > 0) {
-        const lastMsgTime = new Date(parsedT[parsedT.length - 1].timestamp).toDateString();
-        const todayStr = new Date().toDateString();
-        
-        if (lastMsgTime !== todayStr) {
-          setThread([]);
-          localStorage.removeItem("mindpulse_thread_v3");
-        } else {
-          setThread(parsedT);
-        }
+    let migratedProfile: StudentProfile | null = savedP ? JSON.parse(savedP) : null;
+    let migratedThread: DialogueMessage[] | null = savedT ? JSON.parse(savedT) : null;
+    let migratedAnalyses: SavedSessionAnalysis[] | null = savedA ? JSON.parse(savedA) : null;
+    let migratedLA: SavedSessionAnalysis | null = savedLA ? JSON.parse(savedLA) : null;
+
+    // Migrate Profile
+    if (!savedP && legacyProfile) {
+      try {
+        const parsedLegacyP = JSON.parse(legacyProfile);
+        migratedProfile = {
+          examType: parsedLegacyP.examType || "Unknown",
+          moodTrend: parsedLegacyP.moodTrend || parsedLegacyP.mood || "Unknown",
+          triggers: parsedLegacyP.triggers || [],
+          lastTopics: parsedLegacyP.lastTopics || []
+        };
+        localStorage.setItem("mindpulse_profile_v3", JSON.stringify(migratedProfile));
+      } catch (e) {
+        console.error("Failed to migrate legacy profile", e);
       }
     }
+
+    if (migratedProfile) {
+      setProfile(migratedProfile);
+    }
+
+    // Migrate Analyses
+    if (!savedA && legacyAnalysis) {
+      try {
+        const parsedLegacyA = JSON.parse(legacyAnalysis);
+        const singleAnalysis: SavedSessionAnalysis = {
+          detectedPattern: parsedLegacyA.detectedPattern || null,
+          patternReflection: parsedLegacyA.patternReflection || null,
+          moodSignal: parsedLegacyA.moodSignal || "Unknown",
+          stressLevel: typeof parsedLegacyA.stressLevel === "number" ? parsedLegacyA.stressLevel : 5,
+          timestamp: parsedLegacyA.timestamp || new Date().toISOString()
+        };
+        migratedAnalyses = [singleAnalysis];
+        migratedLA = singleAnalysis;
+        localStorage.setItem("mindpulse_analyses_v3", JSON.stringify(migratedAnalyses));
+        localStorage.setItem("mindpulse_latest_analysis_v3", JSON.stringify(migratedLA));
+      } catch (e) {
+        console.error("Failed to migrate legacy analysis", e);
+      }
+    }
+
+    if (migratedAnalyses) {
+      setSavedAnalyses(migratedAnalyses);
+    }
+    if (migratedLA) {
+      setLatestAnalysis(migratedLA);
+    }
+
+    // Migrate Thread/Response
+    if (!savedT && legacyResponse) {
+      try {
+        let content = legacyResponse;
+        try {
+          const parsed = JSON.parse(legacyResponse);
+          if (typeof parsed === "string") {
+            content = parsed;
+          } else if (Array.isArray(parsed)) {
+            migratedThread = parsed.map((m: any) => ({
+              role: m.role || "companion",
+              content: m.content || "",
+              timestamp: m.timestamp || new Date().toISOString()
+            }));
+          } else if (parsed && parsed.companionReply) {
+            content = parsed.companionReply;
+          }
+        } catch {
+          // Plain text
+        }
+
+        if (!migratedThread && content) {
+          migratedThread = [
+            {
+              role: "companion",
+              content: content,
+              timestamp: new Date().toISOString()
+            }
+          ];
+        }
+
+        if (migratedThread) {
+          localStorage.setItem("mindpulse_thread_v3", JSON.stringify(migratedThread));
+        }
+      } catch (e) {
+        console.error("Failed to migrate legacy response/thread", e);
+      }
+    }
+
+    // Apply thread and check if it's from today (so we don't carry over multi-day sittings raw in input unless active)
+    if (migratedThread && migratedThread.length > 0) {
+      const lastMsgTime = new Date(migratedThread[migratedThread.length - 1].timestamp).toDateString();
+      const todayStr = new Date().toDateString();
+      
+      if (lastMsgTime !== todayStr) {
+        setThread([]);
+        localStorage.removeItem("mindpulse_thread_v3");
+      } else {
+        setThread(migratedThread);
+      }
+    }
+
     focusInput();
   }, []);
 
@@ -339,6 +431,11 @@ export default function Home() {
     localStorage.removeItem("mindpulse_thread_v3");
     localStorage.removeItem("mindpulse_analyses_v3");
     localStorage.removeItem("mindpulse_latest_analysis_v3");
+
+    // Also remove legacy keys
+    localStorage.removeItem("mindpulse_profile");
+    localStorage.removeItem("mindpulse_latest_response");
+    localStorage.removeItem("mindpulse_latest_analysis");
 
     setProfile(INITIAL_PROFILE);
     setThread([]);
